@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# MemGit local runtime & mock server state
+.memgit/
+.memgit-server/
+*.db
+*.sqlite3
+
+# OS & Editors
+.DS_Store
+.vscode/
+.idea/

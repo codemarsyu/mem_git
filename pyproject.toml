@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memgit"
+version = "0.1.0"
+description = "MemGit: Distributed Version Control, Cross-Machine & Cross-Model Agent Memory Checkpoint Handoff"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "MemGit Team" }
+]
+dependencies = []
+
+[project.scripts]
+memgit = "memgit.cli:main"

@@ -213,6 +213,43 @@ def _render_handoff_markdown(
         if step.notes:
             lines.append(f"   - *Notes*: {step.notes}")
 
+    if chk.conversation_history:
+        lines.extend([
+            "",
+            f"## 5. Preserved Conversation History (`{len(chk.conversation_history)}` turns, Thinking Stripped)",
+            "- Full portable transcript: `.agent-context/CHAT_HISTORY.md`",
+        ])
+        for idx, turn in enumerate(chk.conversation_history[-8:], start=1):
+            role_label = "User" if turn.role == "user" else f"Assistant ({chk.source_model})"
+            preview = turn.content.replace("\n", " ")[:220]
+            lines.append(f"- **Turn {idx} [{role_label}]** (`{turn.timestamp}`): {preview}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_chat_history_markdown(chk: MemoryCheckpointIR) -> str:
+    """Render portable multi-turn conversation history markdown (`.agent-context/CHAT_HISTORY.md`)."""
+    lines: List[str] = [
+        f"# Portable Conversation History — `{chk.repo_name}` (`{chk.checkpoint_id}`)",
+        "",
+        f"- **Source Agent / Model**: `{chk.source_agent}` (`{chk.source_model}`)",
+        f"- **Captured Turns**: `{len(chk.conversation_history)}` (all `<thinking>` blocks & provider signatures stripped)",
+        "",
+    ]
+    if not chk.conversation_history:
+        lines.append("_No conversation turns recorded in this checkpoint._\n")
+        return "\n".join(lines)
+
+    for idx, turn in enumerate(chk.conversation_history, start=1):
+        role_badge = "USER" if turn.role == "user" else f"ASSISTANT ({chk.source_model})"
+        lines.append(f"## Turn {idx} — {role_badge} (`{turn.timestamp}`)")
+        if turn.tool_summary:
+            lines.append(f"> **Tool Actions**: {turn.tool_summary}")
+            lines.append("")
+        lines.append(turn.content.strip())
+        lines.append("")
+        lines.append("---")
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -292,9 +329,11 @@ def compile_checkpoint(
 
     handoff_md = _render_handoff_markdown(chk, target_agent, target_model, target_host)
     agents_md = _render_concise_agents_md(chk, target_agent, target_model, target_host)
+    chat_history_md = _render_chat_history_markdown(chk)
 
     # Always populate Pattern A universal `.agent-context/` + `AGENTS.md`
     pkg.workspace_files[".agent-context/HANDOFF.md"] = handoff_md
+    pkg.workspace_files[".agent-context/CHAT_HISTORY.md"] = chat_history_md
     pkg.workspace_files["AGENTS.md"] = agents_md
     for topic in chk.topic_memories:
         pkg.workspace_files[f".agent-context/memory/{topic.topic_slug}.md"] = (
@@ -364,8 +403,9 @@ def compile_checkpoint(
             f"- Default Host: `{target_host.os_name}/{target_host.arch}`\n"
             f"- Inspect repo `AGENTS.md` and `.agent-context/HANDOFF.md` on startup.\n"
         )
-        # 2. ~/.codex/memories/memory_summary.md & MEMORY.md
+        # 2. ~/.codex/memories/memory_summary.md, chat_history.md & MEMORY.md
         pkg.home_files[".codex/memories/memory_summary.md"] = handoff_md
+        pkg.home_files[".codex/memories/chat_history.md"] = chat_history_md
         topic_concat = "\n\n---\n\n".join(
             f"## {t.title}\n{t.content}" for t in chk.topic_memories
         )

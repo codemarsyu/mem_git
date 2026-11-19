@@ -47,7 +47,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     home = Path(args.home).resolve()
     adapter = get_adapter(args.agent)
     fp = _default_host_fingerprint(ws, home)
-    chk = adapter.extract_checkpoint(
+    kwargs = dict(
         workspace_root=ws,
         user_home=home,
         repo_name=args.repo,
@@ -58,7 +58,10 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
         branch=args.branch,
         parent_checkpoint_id=args.parent,
     )
-    local_dir = ws / ".memgit" / "checkpoints"
+    if getattr(args, "conversation_id", None) and args.agent in ("antigravity", "gemini"):
+        kwargs["conversation_id"] = args.conversation_id
+    chk = adapter.extract_checkpoint(**kwargs)
+    local_dir = Path(args.output_dir).resolve() if getattr(args, "output_dir", None) else (ws / ".memgit" / "checkpoints")
     local_dir.mkdir(parents=True, exist_ok=True)
     out_file = local_dir / f"{chk.checkpoint_id}.json"
     out_file.write_text(chk.to_json(indent=2), encoding="utf-8")
@@ -120,6 +123,37 @@ def cmd_blame(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_convert(args: argparse.Namespace) -> int:
+    from memgit.converter import CheckpointConverter
+
+    converter = CheckpointConverter()
+    chk = converter.load_checkpoint_file(Path(args.checkpoint).resolve())
+    ws = Path(args.workspace).resolve()
+    home = Path(args.home).resolve()
+    fp = HostFingerprint(
+        os_name=args.target_os or platform.system(),
+        arch=args.target_arch or platform.machine(),
+        workspace_root=str(ws),
+        user_home=str(home),
+        shell="bash" if (args.target_os or "").lower() == "linux" else "zsh",
+        cuda_available=bool(args.cuda),
+        gpu_device="NVIDIA GPU" if args.cuda else ("Apple M-Series MPS" if platform.system() == "Darwin" else "CPU"),
+        hostname=platform.node() or "localhost",
+    )
+    res = converter.convert_and_install(
+        checkpoint=chk,
+        target_agent=args.target_agent,
+        target_model=args.target_model,
+        workspace_root=ws,
+        user_home=home,
+        target_host=fp,
+        include_private=not args.strip_private,
+        verify=not args.no_verify,
+    )
+    print(json.dumps(res.to_dict(), indent=2))
+    return 0
+
+
 def cmd_demo(args: argparse.Namespace) -> int:
     from tests.simulate_roaming_demo import run_full_simulation
     run_full_simulation()
@@ -151,8 +185,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_chk.add_argument("--branch", default="main", help="Branch name")
     p_chk.add_argument("--parent", default=None, help="Parent checkpoint ID")
     p_chk.add_argument("--message", "-m", default="MemGit checkpoint", help="Commit message")
+    p_chk.add_argument("--conversation-id", default=None, help="Specific Antigravity conversation ID to extract")
+    p_chk.add_argument("--output-dir", default=None, help="Output directory for checkpoint JSON")
     p_chk.add_argument("--server-url", default=None, help="Optional Remote Server URL to push immediately")
     p_chk.set_defaults(func=cmd_checkpoint)
+
+    # convert
+    p_conv = sub.add_parser("convert", help="Convert a checkpoint JSON into target agent format (Claude/Codex/Antigravity) and install")
+    p_conv.add_argument("--checkpoint", required=True, help="Path to MemoryCheckpointIR JSON file")
+    p_conv.add_argument("--target-agent", required=True, choices=["claude-code", "codex", "antigravity", "cursor"])
+    p_conv.add_argument("--target-model", required=True, help="Target LLM model name (e.g., claude-4-opus, gpt-5-codex)")
+    p_conv.add_argument("--workspace", required=True, help="Target workspace root directory")
+    p_conv.add_argument("--home", default=str(Path.home()), help="Target user home directory")
+    p_conv.add_argument("--target-os", default=None, help="Override target OS fingerprint")
+    p_conv.add_argument("--target-arch", default=None, help="Override target CPU arch")
+    p_conv.add_argument("--cuda", action="store_true", help="Indicate target machine has CUDA GPU")
+    p_conv.add_argument("--strip-private", action="store_true", help="Strip M_private personal directives")
+    p_conv.add_argument("--no-verify", action="store_true", help="Skip post-write target agent boot simulation")
+    p_conv.set_defaults(func=cmd_convert)
 
     # pull
     p_pull = sub.add_parser("pull", help="Pull, server-transform, and restore checkpoint on destination node")

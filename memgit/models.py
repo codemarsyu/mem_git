@@ -219,6 +219,29 @@ class GitWipBundle:
 
 
 @dataclass
+class ChatTurn:
+    """A single user input or assistant response turn in the portable conversation history (no raw thinking)."""
+    turn_id: str
+    role: str                  # "user" | "assistant"
+    content: str               # Clean markdown text with normalized paths ($WORKSPACE_ROOT, $USER_HOME)
+    timestamp: str = field(default_factory=utc_now_iso)
+    tool_summary: Optional[str] = None  # Concise summary of tool actions taken in this turn (if any)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ChatTurn:
+        return cls(
+            turn_id=data.get("turn_id", "turn_0"),
+            role=data.get("role", "user"),
+            content=data.get("content", ""),
+            timestamp=data.get("timestamp", utc_now_iso()),
+            tool_summary=data.get("tool_summary"),
+        )
+
+
+@dataclass
 class SanitizationStats:
     """Audit metrics proving 4-Pitfall sanitization occurred during checkpointing."""
     stripped_thinking_blocks: int = 0
@@ -227,6 +250,7 @@ class SanitizationStats:
     isolated_user_deferrals: int = 0
     private_facts_count: int = 0
     shared_facts_count: int = 0
+    conversation_turns_captured: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -238,7 +262,7 @@ class SanitizationStats:
 
 @dataclass
 class MemoryCheckpointIR:
-    """Atomic State Commit combining Declarative Memory IR, Provenance DAG, and Git WIP Patch."""
+    """Atomic State Commit combining Declarative Memory IR, Provenance DAG, Conversation History, and Git WIP Patch."""
     checkpoint_id: str
     repo_name: str
     branch: str
@@ -256,6 +280,7 @@ class MemoryCheckpointIR:
         default_factory=lambda: ExecutionStack(active_goal="General development")
     )
     topic_memories: List[TopicMemoryFile] = field(default_factory=list)
+    conversation_history: List[ChatTurn] = field(default_factory=list)
     git_wip: GitWipBundle = field(
         default_factory=lambda: GitWipBundle(base_commit="HEAD", branch="main")
     )
@@ -283,6 +308,7 @@ class MemoryCheckpointIR:
             "user_deferrals": [d.to_dict() for d in self.user_deferrals],
             "execution_stack": self.execution_stack.to_dict(),
             "topic_memories": [t.to_dict() for t in self.topic_memories],
+            "conversation_history": [c.to_dict() for c in self.conversation_history],
             "git_wip": self.git_wip.to_dict(),
             "sanitization_stats": self.sanitization_stats.to_dict(),
         }
@@ -308,6 +334,7 @@ class MemoryCheckpointIR:
             user_deferrals=[UserDeferralLock.from_dict(d) for d in data.get("user_deferrals", [])],
             execution_stack=ExecutionStack.from_dict(data.get("execution_stack", {})),
             topic_memories=[TopicMemoryFile.from_dict(t) for t in data.get("topic_memories", [])],
+            conversation_history=[ChatTurn.from_dict(c) for c in data.get("conversation_history", [])],
             git_wip=GitWipBundle.from_dict(data.get("git_wip", {"base_commit": "HEAD", "branch": "main"})),
             sanitization_stats=SanitizationStats.from_dict(data.get("sanitization_stats", {})),
         )

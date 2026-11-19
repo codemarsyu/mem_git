@@ -19,6 +19,7 @@ from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
 from memgit.git_wip import capture_git_wip_bundle
 from memgit.models import (
     AgentType,
+    ChatTurn,
     ExecutionStack,
     HostFingerprint,
     MemoryCheckpointIR,
@@ -205,6 +206,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         negative_memories: List[NegativeMemoryItem] = []
         user_deferrals: List[UserDeferralLock] = []
         topic_memories: List[TopicMemoryFile] = []
+        conversation_history: List[ChatTurn] = []
         execution_stack = ExecutionStack(active_goal="Continue development task")
 
         proj_slug = repo_name.replace("/", "-")
@@ -306,13 +308,49 @@ class ClaudeCodeAdapter(AgentAdapter):
                     if not line.strip():
                         continue
                     ev = json.loads(line)
-                    # Count and strip thinking blocks & tool_use schemas
-                    for block in ev.get("content", []) if isinstance(ev.get("content"), list) else []:
+                    # Count and strip thinking blocks & tool_use schemas, while extracting user/assistant chat turns
+                    ev_type = ev.get("type", "")
+                    ev_ts = ev.get("timestamp", now)
+                    text_parts: List[str] = []
+                    tool_parts: List[str] = []
+
+                    raw_blocks = ev.get("content", [])
+                    if not isinstance(raw_blocks, list) and isinstance(ev.get("message"), dict):
+                        msg_content = ev["message"].get("content", "")
+                        if isinstance(msg_content, list):
+                            raw_blocks = msg_content
+                        elif isinstance(msg_content, str) and msg_content.strip():
+                            text_parts.append(msg_content.strip())
+                    elif isinstance(ev.get("message"), str) and ev["message"].strip():
+                        text_parts.append(ev["message"].strip())
+
+                    for block in raw_blocks if isinstance(raw_blocks, list) else []:
                         if isinstance(block, dict):
                             if block.get("type") == "thinking":
                                 stats.stripped_thinking_blocks += 1
                             elif block.get("type") == "tool_use":
                                 stats.stripped_tool_call_schemas += 1
+                                tname = block.get("name", "tool")
+                                tool_parts.append(f"`{tname}`")
+                            elif block.get("type") == "text" and block.get("text"):
+                                text_parts.append(str(block["text"]).strip())
+
+                    if ev_type in ("user", "assistant") and (text_parts or tool_parts):
+                        joined_text = "\n\n".join(text_parts) if text_parts else f"Executed {', '.join(tool_parts)}."
+                        clean_txt, s_cnt = strip_thinking_blocks(joined_text)
+                        stats.stripped_thinking_blocks += s_cnt
+                        norm_txt, p_cnt = normalize_paths_to_ir(clean_txt, host_fingerprint)
+                        stats.normalized_host_paths += p_cnt
+                        conversation_history.append(
+                            ChatTurn(
+                                turn_id=f"turn_{ev_type}_{len(conversation_history)+1}",
+                                role=ev_type,
+                                content=norm_txt,
+                                timestamp=ev_ts,
+                                tool_summary=", ".join(tool_parts) if tool_parts else None,
+                            )
+                        )
+                        stats.conversation_turns_captured += 1
 
                     if "memgit_deferral" in ev:
                         d_raw = ev["memgit_deferral"]
@@ -372,6 +410,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             user_deferrals=user_deferrals,
             execution_stack=execution_stack,
             topic_memories=topic_memories,
+            conversation_history=conversation_history,
             git_wip=git_wip,
             sanitization_stats=stats,
         )
@@ -414,7 +453,12 @@ class ClaudeCodeAdapter(AgentAdapter):
                 report.loaded_files.append(str(path))
                 assembled_chunks.append(text)
 
-        mem_index = user_home / ".claude" / "projects" / proj_slug / "memory" / "MEMORY.md"
+        encoded_key = re.sub(r"[^a-zA-Z0-9-]", "-", str(workspace_root.resolve()))
+        mem_dir = user_home / ".claude" / "projects" / encoded_key / "memory"
+        if not (mem_dir / "MEMORY.md").exists():
+            mem_dir = user_home / ".claude" / "projects" / proj_slug / "memory"
+
+        mem_index = mem_dir / "MEMORY.md"
         if mem_index.exists():
             raw_mem = mem_index.read_text(encoding="utf-8")
             lines = raw_mem.splitlines()
@@ -425,6 +469,13 @@ class ClaudeCodeAdapter(AgentAdapter):
             loaded_mem = "\n".join(lines[:200])
             report.loaded_files.append(str(mem_index))
             assembled_chunks.append(loaded_mem)
+
+            # Simulate on-demand resolution of linked topic files from MEMORY.md
+            for m_link in re.finditer(r"\]\(\.?/?([a-zA-Z0-9_./-]+\.md)\)", loaded_mem):
+                topic_p = mem_dir / m_link.group(1)
+                if topic_p.exists() and str(topic_p) not in report.loaded_files:
+                    report.loaded_files.append(str(topic_p))
+                    assembled_chunks.append(topic_p.read_text(encoding="utf-8"))
 
         full_context = "\n\n".join(assembled_chunks)
         report.context_window_bytes = len(full_context.encode("utf-8"))

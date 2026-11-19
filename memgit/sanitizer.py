@@ -165,4 +165,9 @@ def filter_checkpoint_for_target(
         topic.summary = rehydrate_paths_for_target(topic.summary, target_host)
         topic.content = rehydrate_paths_for_target(topic.content, target_host)
 
+    for turn in transformed.conversation_history:
+        turn.content = rehydrate_paths_for_target(turn.content, target_host)
+        if turn.tool_summary:
+            turn.tool_summary = rehydrate_paths_for_target(turn.tool_summary, target_host)
+
     return transformed

@@ -10,12 +10,13 @@ Models Claude Code's Four-Tier Progressive Hierarchy:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
-from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
+from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport, AgentSessionSummary
 from memgit.git_wip import capture_git_wip_bundle
 from memgit.models import (
     AgentType,
@@ -43,6 +44,58 @@ from memgit.sanitizer import (
 
 class ClaudeCodeAdapter(AgentAdapter):
     agent_type = AgentType.CLAUDE_CODE.value
+
+    def list_sessions(
+        self,
+        user_home: Path,
+        workspace_root: Optional[Path] = None,
+    ) -> List[AgentSessionSummary]:
+        projects_dir = user_home.resolve() / ".claude" / "projects"
+        if not projects_dir.exists():
+            return []
+        summaries: List[AgentSessionSummary] = []
+        for proj_dir in projects_dir.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            for jf in proj_dir.glob("*.jsonl"):
+                title = jf.stem
+                turns = 0
+                ws = ""
+                try:
+                    for line in jf.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if not line.strip():
+                            continue
+                        obj = json.loads(line)
+                        if not ws and isinstance(obj.get("cwd"), str):
+                            ws = obj["cwd"]
+                        msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+                        role = msg.get("role") or obj.get("type")
+                        if role in ("user", "assistant"):
+                            turns += 1
+                            if role == "user" and title == jf.stem:
+                                content = msg.get("content", "")
+                                if isinstance(content, list):
+                                    text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                                    content = " ".join(text_parts)
+                                if isinstance(content, str) and content.strip():
+                                    first_line = content.strip().splitlines()[0]
+                                    title = (first_line[:77] + "...") if len(first_line) > 80 else first_line
+                except (OSError, json.JSONDecodeError):
+                    continue
+                ts = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc).isoformat()
+                summaries.append(
+                    AgentSessionSummary(
+                        session_id=jf.stem,
+                        agent_type=self.agent_type,
+                        title=title,
+                        updated_at=ts,
+                        turn_count=turns,
+                        workspace_path=ws,
+                        source_path=str(jf),
+                    )
+                )
+        summaries.sort(key=lambda s: s.updated_at, reverse=True)
+        return summaries
 
     @staticmethod
     def seed_mock_claude_session(

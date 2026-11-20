@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 import sqlite3
 from typing import List, Optional
 
-from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
+from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport, AgentSessionSummary
+from memgit.paths import cursor_storage_dir
 from memgit.compiler import CompiledMemoryPackage
 from memgit.git_wip import capture_git_wip_bundle
 from memgit.models import (
@@ -25,6 +27,50 @@ from memgit.sanitizer import normalize_paths_to_ir
 
 class CursorAdapter(AgentAdapter):
     agent_type = AgentType.CURSOR.value
+
+    def list_sessions(
+        self,
+        user_home: Path,
+        workspace_root: Optional[Path] = None,
+    ) -> List[AgentSessionSummary]:
+        summaries: List[AgentSessionSummary] = []
+        home = user_home.resolve()
+        db_candidates = [
+            home / ".cursor" / "User" / "workspaceStorage" / "state.vscdb",
+            cursor_storage_dir(home) / "state.vscdb",
+        ]
+        for db_path in db_candidates:
+            if not db_path.exists():
+                continue
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=3.0)
+                try:
+                    has_tbl = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='ItemTable'"
+                    ).fetchone()
+                    if not has_tbl:
+                        continue
+                    rows = conn.execute(
+                        "SELECT key FROM ItemTable WHERE key LIKE 'memgit.%' OR key LIKE '%composer%' LIMIT 20"
+                    ).fetchall()
+                    ts = datetime.fromtimestamp(db_path.stat().st_mtime, tz=timezone.utc).isoformat()
+                    for (k,) in rows:
+                        summaries.append(
+                            AgentSessionSummary(
+                                session_id=str(k),
+                                agent_type=self.agent_type,
+                                title=str(k),
+                                updated_at=ts,
+                                turn_count=0,
+                                workspace_path=str(workspace_root) if workspace_root else "",
+                                source_path=str(db_path),
+                            )
+                        )
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                continue
+        return summaries
 
     def install_compiled_package(
         self,

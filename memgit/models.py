@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 
 class AgentType(str, Enum):
+    CLAUDE_DESKTOP = "claude-desktop"
     CLAUDE_CODE = "claude-code"
     CODEX_CLI = "codex"
     ANTIGRAVITY = "antigravity"
@@ -244,7 +245,7 @@ class ChatTurn:
 
 @dataclass
 class SanitizationStats:
-    """Audit metrics proving 4-Pitfall sanitization occurred during checkpointing."""
+    """Audit metrics proving 4-Pitfall sanitization and secret redaction occurred during checkpointing."""
     stripped_thinking_blocks: int = 0
     stripped_tool_call_schemas: int = 0
     normalized_host_paths: int = 0
@@ -252,13 +253,16 @@ class SanitizationStats:
     private_facts_count: int = 0
     shared_facts_count: int = 0
     conversation_turns_captured: int = 0
+    redacted_secrets: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> SanitizationStats:
-        return cls(**data)
+        valid = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid}
+        return cls(**filtered)
 
 
 @dataclass

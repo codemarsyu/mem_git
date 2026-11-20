@@ -41,6 +41,120 @@ DEFERRAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Regex patterns for Secret Redaction (never persist raw keys/tokens in checkpoints or bundles)
+_SECRET_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    (
+        "PEM_PRIVATE_KEY",
+        re.compile(
+            r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+    ),
+    ("ANTHROPIC_API_KEY", re.compile(r"\bsk-ant-[a-zA-Z0-9_\-]{16,}\b")),
+    ("OPENAI_API_KEY", re.compile(r"\bsk-(?:proj-|svcacct-|live-|test-)?[a-zA-Z0-9_\-]{20,}\b")),
+    ("GOOGLE_API_KEY", re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}\b")),
+    ("GITHUB_TOKEN", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b")),
+    ("GITHUB_PAT", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("AWS_ACCESS_KEY", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("SLACK_TOKEN", re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b")),
+    (
+        "BEARER_TOKEN",
+        re.compile(r"(Bearer\s+)([A-Za-z0-9\-._~+/]{20,}=*)", re.IGNORECASE),
+    ),
+    (
+        "ENV_SECRET_ASSIGNMENT",
+        re.compile(
+            r"(\b[A-Z][A-Z0-9_]*(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|PASSWORD|SECRET)\s*=\s*['\"]?)([^\s'\"`,;]{12,})(['\"]?)"
+        ),
+    ),
+]
+
+
+def redact_secrets(text: str) -> Tuple[str, int]:
+    """Detect and mask API keys, tokens, private keys, and secret env assignments."""
+    if not text:
+        return text, 0
+    redacted = text
+    total = 0
+    for label, pattern in _SECRET_PATTERNS:
+        if label == "BEARER_TOKEN":
+            def _mask_bearer(m: re.Match) -> str:
+                nonlocal total
+                val = m.group(2)
+                if "[REDACTED" in val:
+                    return m.group(0)
+                total += 1
+                return f"{m.group(1)}[REDACTED_BEARER_TOKEN]"
+
+            redacted = pattern.sub(_mask_bearer, redacted)
+        elif label == "ENV_SECRET_ASSIGNMENT":
+            def _mask_env(m: re.Match) -> str:
+                nonlocal total
+                val = m.group(2)
+                if val.startswith("$") or "[REDACTED" in val or val.upper() in ("YOUR_API_KEY", "YOUR_KEY_HERE", "CHANGEME"):
+                    return m.group(0)
+                total += 1
+                return f"{m.group(1)}[REDACTED_SECRET]{m.group(3)}"
+
+            redacted = pattern.sub(_mask_env, redacted)
+        else:
+            def _mask_direct(m: re.Match, lbl: str = label) -> str:
+                nonlocal total
+                total += 1
+                return f"[REDACTED_{lbl}]"
+
+            redacted = pattern.sub(_mask_direct, redacted)
+    return redacted, total
+
+
+def redact_checkpoint_secrets(checkpoint: MemoryCheckpointIR) -> int:
+    """In-place redact secrets across all text fields of a MemoryCheckpointIR and update stats."""
+    total = 0
+
+    def _scrub(value: str) -> str:
+        nonlocal total
+        cleaned, cnt = redact_secrets(value)
+        total += cnt
+        return cleaned
+
+    checkpoint.message = _scrub(checkpoint.message)
+    for fact in checkpoint.confirmed_facts:
+        fact.statement = _scrub(fact.statement)
+    for neg in checkpoint.negative_memories:
+        neg.hypothesis = _scrub(neg.hypothesis)
+        neg.failure_reason = _scrub(neg.failure_reason)
+    for deferral in checkpoint.user_deferrals:
+        deferral.feature_or_option = _scrub(deferral.feature_or_option)
+        deferral.directive = _scrub(deferral.directive)
+
+    checkpoint.execution_stack.active_goal = _scrub(checkpoint.execution_stack.active_goal)
+    checkpoint.execution_stack.current_hypothesis = _scrub(checkpoint.execution_stack.current_hypothesis)
+    checkpoint.execution_stack.stack_trace_digest = _scrub(checkpoint.execution_stack.stack_trace_digest)
+    for step in checkpoint.execution_stack.steps:
+        step.title = _scrub(step.title)
+        step.notes = _scrub(step.notes)
+        if step.verification_cmd:
+            step.verification_cmd = _scrub(step.verification_cmd)
+
+    for topic in checkpoint.topic_memories:
+        topic.title = _scrub(topic.title)
+        topic.summary = _scrub(topic.summary)
+        topic.content = _scrub(topic.content)
+
+    for turn in checkpoint.conversation_history:
+        turn.content = _scrub(turn.content)
+        if turn.tool_summary:
+            turn.tool_summary = _scrub(turn.tool_summary)
+
+    if checkpoint.git_wip:
+        checkpoint.git_wip.staged_diff = _scrub(checkpoint.git_wip.staged_diff)
+        checkpoint.git_wip.unstaged_diff = _scrub(checkpoint.git_wip.unstaged_diff)
+        for rel_p, body in list(checkpoint.git_wip.untracked_files.items()):
+            checkpoint.git_wip.untracked_files[rel_p] = _scrub(body)
+
+    checkpoint.sanitization_stats.redacted_secrets += total
+    return total
+
 
 def strip_thinking_blocks(text: str) -> Tuple[str, int]:
     """Remove <thinking> blocks and cryptographic thought signatures from text."""
@@ -170,4 +284,5 @@ def filter_checkpoint_for_target(
         if turn.tool_summary:
             turn.tool_summary = rehydrate_paths_for_target(turn.tool_summary, target_host)
 
+    redact_checkpoint_secrets(transformed)
     return transformed

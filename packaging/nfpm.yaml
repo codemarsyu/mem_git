@@ -1,0 +1,30 @@
+name: "memgit"
+arch: "${ARCH}"
+platform: "linux"
+version: "${VERSION}"
+section: "devel"
+priority: "optional"
+maintainer: "MemGit Team <maintainers@memgit.dev>"
+description: |
+  MemGit: Cross-Agent & Cross-Machine AI Coding Agent Memory CLI
+  Discover, checkpoint, sanitize, transform, and resume sessions across
+  Claude Desktop, Claude Code, Google Antigravity, Gemini CLI, Codex CLI, and Cursor.
+homepage: "https://github.com/codemarsyu/mem_git"
+license: "MIT"
+contents:
+  - src: "./dist/memgit"
+    dst: "/usr/local/bin/memgit"
+    file_info:
+      mode: 0755
+  - src: "./dist/completions/_memgit"
+    dst: "/usr/share/zsh/vendor-completions/_memgit"
+    file_info:
+      mode: 0644
+  - src: "./dist/completions/memgit.bash"
+    dst: "/usr/share/bash-completion/completions/memgit"
+    file_info:
+      mode: 0644
+  - src: "./dist/completions/memgit.fish"
+    dst: "/usr/share/fish/vendor_completions.d/memgit.fish"
+    file_info:
+      mode: 0644

@@ -1,0 +1,39 @@
+class Memgit < Formula
+  desc "Cross-agent & cross-machine AI coding agent memory checkpoint, transform, and resume CLI"
+  homepage "https://github.com/codemarsyu/mem_git"
+  version "__VERSION__"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/codemarsyu/mem_git/releases/download/v__VERSION__/memgit-__VERSION__-darwin-arm64.tar.gz"
+      sha256 "__SHA256_DARWIN_ARM64__"
+    else
+      url "https://github.com/codemarsyu/mem_git/releases/download/v__VERSION__/memgit-__VERSION__-darwin-x86_64.tar.gz"
+      sha256 "__SHA256_DARWIN_X86_64__"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/codemarsyu/mem_git/releases/download/v__VERSION__/memgit-__VERSION__-linux-arm64.tar.gz"
+      sha256 "__SHA256_LINUX_ARM64__"
+    else
+      url "https://github.com/codemarsyu/mem_git/releases/download/v__VERSION__/memgit-__VERSION__-linux-x86_64.tar.gz"
+      sha256 "__SHA256_LINUX_X86_64__"
+    end
+  end
+
+  def install
+    bin.install "memgit"
+    zsh_completion.install "completions/_memgit" if File.exist?("completions/_memgit")
+    bash_completion.install "completions/memgit.bash" => "memgit" if File.exist?("completions/memgit.bash")
+    fish_completion.install "completions/memgit.fish" if File.exist?("completions/memgit.fish")
+  end
+
+  test do
+    assert_match "memgit #{version}", shell_output("#{bin}/memgit --version")
+    output = shell_output("#{bin}/memgit doctor --json")
+    assert_match "\"memgit_version\"", output
+  end
+end

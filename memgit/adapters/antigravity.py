@@ -8,12 +8,14 @@ Models Google Antigravity's Three-Tier Architecture:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import sqlite3
 from typing import List, Optional
 
-from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
+from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport, AgentSessionSummary
 from memgit.git_wip import capture_git_wip_bundle
 from memgit.models import (
     AgentType,
@@ -39,6 +41,88 @@ from memgit.sanitizer import (
 
 class AntigravityAdapter(AgentAdapter):
     agent_type = AgentType.ANTIGRAVITY.value
+
+    def list_sessions(
+        self,
+        user_home: Path,
+        workspace_root: Optional[Path] = None,
+    ) -> List[AgentSessionSummary]:
+        home = user_home.resolve()
+        agy_dir = home / ".gemini" / "antigravity"
+        summaries: List[AgentSessionSummary] = []
+        seen: set = set()
+
+        # 1. Read conversation_summaries.db (primary index)
+        summary_db = agy_dir / "conversation_summaries.db"
+        if summary_db.exists():
+            try:
+                conn = sqlite3.connect(str(summary_db), timeout=3.0)
+                try:
+                    rows = conn.execute(
+                        "SELECT conversation_id, title, step_count, last_modified_time, workspace_uris, source "
+                        "FROM conversation_summaries ORDER BY last_modified_time DESC"
+                    ).fetchall()
+                    for cid, title, step_cnt, mtime, ws_uris, src in rows:
+                        if not cid or cid in seen:
+                            continue
+                        if src == "CORTEX_TRAJECTORY_SOURCE_CLI" and not title:
+                            continue
+                        seen.add(cid)
+                        ws_str = ""
+                        if ws_uris:
+                            try:
+                                parsed_ws = json.loads(ws_uris)
+                                if isinstance(parsed_ws, list) and parsed_ws:
+                                    ws_str = str(parsed_ws[0]).replace("file://", "")
+                            except json.JSONDecodeError:
+                                ws_str = str(ws_uris)
+                        summaries.append(
+                            AgentSessionSummary(
+                                session_id=str(cid),
+                                agent_type=self.agent_type,
+                                title=str(title or cid),
+                                updated_at=str(mtime or ""),
+                                turn_count=int(step_cnt or 0),
+                                workspace_path=ws_str,
+                                source_path=str(agy_dir / "conversations" / f"{cid}.db"),
+                            )
+                        )
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                pass
+
+        # 2. Fall back to brain/<uuid>/ folders not in SQLite (ignoring helper dirs like tempmediaStorage)
+        uuid_pat = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+        title_pat = re.compile(r'title:"((?:\\.|[^"\\])*)"')
+        brain_dir = agy_dir / "brain"
+        if brain_dir.exists():
+            for entry in sorted(brain_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                if not entry.is_dir() or entry.name in seen or not uuid_pat.match(entry.name):
+                    continue
+                seen.add(entry.name)
+                resolved_title = entry.name
+                ann_file = agy_dir / "annotations" / f"{entry.name}.pbtxt"
+                if ann_file.exists():
+                    try:
+                        m = title_pat.search(ann_file.read_text(encoding="utf-8", errors="replace"))
+                        if m:
+                            resolved_title = m.group(1).replace('\\"', '"').replace("\\\\", "\\")
+                    except OSError:
+                        pass
+                ts = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc).isoformat()
+                summaries.append(
+                    AgentSessionSummary(
+                        session_id=entry.name,
+                        agent_type=self.agent_type,
+                        title=resolved_title,
+                        updated_at=ts,
+                        turn_count=0,
+                        workspace_path="",
+                        source_path=str(entry),
+                    )
+                )
+        return summaries
 
     def extract_checkpoint(
         self,

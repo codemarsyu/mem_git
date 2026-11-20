@@ -8,12 +8,13 @@ Models Gemini CLI's distinct storage layout (separate from Google Antigravity):
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 from typing import List, Optional
 
-from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
+from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport, AgentSessionSummary
 from memgit.git_wip import capture_git_wip_bundle
 from memgit.models import (
     AgentType,
@@ -39,6 +40,45 @@ from memgit.sanitizer import (
 
 class GeminiCLIAdapter(AgentAdapter):
     agent_type = AgentType.GEMINI_CLI.value
+
+    def list_sessions(
+        self,
+        user_home: Path,
+        workspace_root: Optional[Path] = None,
+    ) -> List[AgentSessionSummary]:
+        tmp_root = user_home.resolve() / ".gemini" / "tmp"
+        if not tmp_root.exists():
+            return []
+        summaries: List[AgentSessionSummary] = []
+        for sf in sorted(tmp_root.glob("*/chats/session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            title = sf.stem
+            turns = 0
+            try:
+                data = json.loads(sf.read_text(encoding="utf-8"))
+                msgs = data.get("messages", []) if isinstance(data, dict) else []
+                turns = len(msgs)
+                for m in msgs:
+                    if isinstance(m, dict) and str(m.get("type", "")).lower() in ("user", "human"):
+                        txt = str(m.get("content", "")).strip()
+                        if txt:
+                            first = txt.splitlines()[0]
+                            title = (first[:77] + "...") if len(first) > 80 else first
+                            break
+            except (OSError, json.JSONDecodeError):
+                pass
+            ts = datetime.fromtimestamp(sf.stat().st_mtime, tz=timezone.utc).isoformat()
+            summaries.append(
+                AgentSessionSummary(
+                    session_id=sf.stem,
+                    agent_type=self.agent_type,
+                    title=title,
+                    updated_at=ts,
+                    turn_count=turns,
+                    workspace_path="",
+                    source_path=str(sf),
+                )
+            )
+        return summaries
 
     def extract_checkpoint(
         self,

@@ -54,10 +54,41 @@ class AgentBootSimulationReport:
         }
 
 
+@dataclass
+class AgentSessionSummary:
+    """Unified summary of a discoverable conversation/session across any installed agent."""
+    session_id: str
+    agent_type: str
+    title: str
+    updated_at: str = ""
+    turn_count: int = 0
+    workspace_path: str = ""
+    source_path: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "agent_type": self.agent_type,
+            "title": self.title,
+            "updated_at": self.updated_at,
+            "turn_count": self.turn_count,
+            "workspace_path": self.workspace_path,
+            "source_path": self.source_path,
+        }
+
+
 class AgentAdapter(ABC):
     """Abstract adapter for extracting, installing, and simulating an LLM coding agent's memory."""
 
     agent_type: str
+
+    def list_sessions(
+        self,
+        user_home: Path,
+        workspace_root: Optional[Path] = None,
+    ) -> List[AgentSessionSummary]:
+        """Discover local conversations/sessions stored by this agent on the current host."""
+        return []
 
     @abstractmethod
     def extract_checkpoint(

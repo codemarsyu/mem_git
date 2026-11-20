@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from memgit.adapters import AgentBootSimulationReport, get_adapter
+from memgit.backup import BackupManager, BackupTransaction
 from memgit.compiler import CompiledMemoryPackage, compile_checkpoint
 from memgit.models import (
     AgentType,
@@ -42,6 +43,19 @@ from memgit.models import (
     MemoryCheckpointIR,
     TaskLockStatus,
     VerificationStatus,
+)
+from memgit.sync import (
+    backup_sqlite_if_nonempty,
+    patch_trajectory_db_standalone,
+    pb_encode_bytes_field,
+    pb_encode_varint,
+    pb_encode_varint_field,
+    pb_iter_fields,
+    pb_patch_raw_summary_standalone,
+    pb_patch_trajectory_metadata_standalone,
+    pb_read_varint,
+    sync_agyhub_summaries_proto,
+    sync_antigravity_cli_session_to_app,
 )
 from memgit.sanitizer import filter_checkpoint_for_target
 
@@ -142,6 +156,11 @@ class ConversionResult:
     operations_performed: List[str] = field(default_factory=list)
     boot_verification: Optional[AgentBootSimulationReport] = None
     bootstrap_session: Optional[BootstrapSessionReport] = None
+    tier1_succeeded: bool = True
+    tier2_status: str = "skipped"  # "applied" | "skipped" | "fallback"
+    tier2_warnings: List[str] = field(default_factory=list)
+    backup_id: Optional[str] = None
+    dry_run: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -158,6 +177,11 @@ class ConversionResult:
             "operations_performed": self.operations_performed,
             "boot_verification": self.boot_verification.to_dict() if self.boot_verification else None,
             "bootstrap_session": self.bootstrap_session.to_dict() if self.bootstrap_session else None,
+            "tier1_succeeded": self.tier1_succeeded,
+            "tier2_status": self.tier2_status,
+            "tier2_warnings": self.tier2_warnings,
+            "backup_id": self.backup_id,
+            "dry_run": self.dry_run,
         }
 
 
@@ -898,307 +922,17 @@ class CheckpointConverter:
             f"followed by 'Current State & Next Step', and then pause for the user's next instruction."
         )
 
-    @staticmethod
-    def _backup_sqlite_if_nonempty(src_db: Path, dest_db: Path) -> int:
-        """Read `src_db` (merging any WAL frames) and copy into `dest_db` via SQLite backup
-        ONLY if the `steps` table contains at least 1 row. Returns the step count (0 if empty/unreadable)."""
-        if not src_db.exists():
-            return 0
-        try:
-            src_conn = sqlite3.connect(str(src_db), timeout=5.0)
-        except sqlite3.Error:
-            try:
-                src_conn = sqlite3.connect(f"file:{src_db}?immutable=1", uri=True)
-            except sqlite3.Error:
-                return 0
-        try:
-            row = src_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='steps'"
-            ).fetchone()
-            if not row:
-                return 0
-            step_count = int(src_conn.execute("SELECT COUNT(*) FROM steps").fetchone()[0])
-            if step_count <= 0:
-                return 0
-            dest_db.parent.mkdir(parents=True, exist_ok=True)
-            tmp_dest = dest_db.with_suffix(".db.tmp")
-            if tmp_dest.exists():
-                tmp_dest.unlink()
-            dst_conn = sqlite3.connect(str(tmp_dest))
-            try:
-                src_conn.backup(dst_conn)
-            finally:
-                dst_conn.close()
-            tmp_dest.replace(dest_db)
-            return step_count
-        except sqlite3.Error:
-            return 0
-        finally:
-            src_conn.close()
-
-    @staticmethod
-    def _pb_encode_varint(value: int) -> bytes:
-        out = bytearray()
-        while True:
-            b = value & 0x7F
-            value >>= 7
-            if value:
-                out.append(b | 0x80)
-            else:
-                out.append(b)
-                return bytes(out)
-
-    @staticmethod
-    def _pb_read_varint(buf: bytes, pos: int) -> Tuple[int, int]:
-        val = 0
-        shift = 0
-        n = len(buf)
-        while pos < n:
-            b = buf[pos]
-            pos += 1
-            val |= (b & 0x7F) << shift
-            if not (b & 0x80):
-                return val, pos
-            shift += 7
-            if shift > 70:
-                raise ValueError("varint overflow")
-        raise ValueError("truncated varint")
-
-    @classmethod
-    def _pb_iter_fields(cls, buf: bytes) -> List[Tuple[int, int, bytes, bytes]]:
-        """Parse top-level protobuf fields as (field_number, wire_type, raw_field_bytes, payload_bytes)."""
-        fields: List[Tuple[int, int, bytes, bytes]] = []
-        pos = 0
-        n = len(buf)
-        while pos < n:
-            start = pos
-            tag, pos = cls._pb_read_varint(buf, pos)
-            field_num = tag >> 3
-            wire_type = tag & 7
-            if field_num == 0:
-                raise ValueError("invalid field number 0")
-            if wire_type == 0:
-                _, pos = cls._pb_read_varint(buf, pos)
-                payload = buf[start:pos]
-            elif wire_type == 1:
-                if pos + 8 > n:
-                    raise ValueError("truncated 64-bit field")
-                payload = buf[pos : pos + 8]
-                pos += 8
-            elif wire_type == 2:
-                length, pos = cls._pb_read_varint(buf, pos)
-                if pos + length > n:
-                    raise ValueError("truncated length-delimited field")
-                payload = buf[pos : pos + length]
-                pos += length
-            elif wire_type == 5:
-                if pos + 4 > n:
-                    raise ValueError("truncated 32-bit field")
-                payload = buf[pos : pos + 4]
-                pos += 4
-            else:
-                raise ValueError(f"unsupported wire type {wire_type}")
-            fields.append((field_num, wire_type, buf[start:pos], payload))
-        return fields
-
-    @classmethod
-    def _pb_encode_bytes_field(cls, field_num: int, payload: bytes) -> bytes:
-        return (
-            cls._pb_encode_varint((field_num << 3) | 2)
-            + cls._pb_encode_varint(len(payload))
-            + payload
-        )
-
-    @classmethod
-    def _pb_patch_trajectory_metadata_standalone(cls, data: bytes, conv_id: Optional[str] = None) -> bytes:
-        """Rewrite Antigravity's trajectory metadata protobuf so it matches a native standalone
-        conversation under top-level Conversations (`project_id = "outside-of-project"`, no
-        workspace info `f1` or workspace URI `f7`)."""
-        try:
-            fields = cls._pb_iter_fields(data) if data else []
-        except ValueError:
-            return data
-        out = bytearray()
-        saw_cid = False
-        saw_project = False
-        for field_num, wire_type, raw, _payload in fields:
-            if field_num in (1, 7):
-                # Strip workspace metadata (f1) and workspace URI (f7)
-                continue
-            if field_num == 6 and wire_type == 2:
-                saw_cid = True
-                out.extend(raw)
-            elif field_num == 18 and wire_type == 2:
-                out.extend(cls._pb_encode_bytes_field(18, b"outside-of-project"))
-                saw_project = True
-            else:
-                out.extend(raw)
-        if not saw_cid and conv_id:
-            out.extend(cls._pb_encode_bytes_field(6, conv_id.encode("utf-8")))
-        if not saw_project:
-            out.extend(cls._pb_encode_bytes_field(18, b"outside-of-project"))
-        return bytes(out)
-
-    @classmethod
-    def _pb_encode_varint_field(cls, field_num: int, value: int) -> bytes:
-        return cls._pb_encode_varint((field_num << 3) | 0) + cls._pb_encode_varint(value)
-
-    @classmethod
-    def _pb_patch_raw_summary_standalone(
-        cls,
-        data: bytes,
-        title: Optional[str] = None,
-        conv_id: Optional[str] = None,
-    ) -> bytes:
-        """Rewrite Antigravity's `conversation_summaries.raw_summary` protobuf so it matches a
-        native Desktop App standalone conversation: no workspace block (`f9`), no CLI source enum
-        (`f20`), `outside-of-project` inside `f17` with exact length varints, and the original
-        conversation title in both `f1` and annotations block `f15`."""
-        try:
-            fields = cls._pb_iter_fields(data)
-        except ValueError:
-            return data
-        out = bytearray()
-        saw_title = False
-        saw_f15 = False
-        saw_f17 = False
-        title_bytes = title.encode("utf-8") if title else None
-        ann_msg = b""
-        if title_bytes is not None:
-            ts_msg = cls._pb_encode_varint_field(1, int(time.time()))
-            ann_msg = cls._pb_encode_bytes_field(1, title_bytes) + cls._pb_encode_bytes_field(7, ts_msg)
-
-        for field_num, wire_type, raw, payload in fields:
-            if field_num in (9, 20):
-                # Strip workspace info block (f9) and CLI source enum (f20)
-                continue
-            if field_num == 1 and wire_type == 2 and title_bytes is not None:
-                out.extend(cls._pb_encode_bytes_field(1, title_bytes))
-                saw_title = True
-            elif field_num == 15 and wire_type == 2 and title_bytes is not None:
-                out.extend(cls._pb_encode_bytes_field(15, ann_msg))
-                saw_f15 = True
-            elif field_num == 17 and wire_type == 2:
-                patched_meta = cls._pb_patch_trajectory_metadata_standalone(payload, conv_id=conv_id)
-                out.extend(cls._pb_encode_bytes_field(17, patched_meta))
-                saw_f17 = True
-            else:
-                out.extend(raw)
-        if title_bytes is not None and not saw_title:
-            out = bytearray(cls._pb_encode_bytes_field(1, title_bytes)) + out
-        if title_bytes is not None and not saw_f15:
-            out.extend(cls._pb_encode_bytes_field(15, ann_msg))
-        if not saw_f17:
-            patched_meta = cls._pb_patch_trajectory_metadata_standalone(b"", conv_id=conv_id)
-            out.extend(cls._pb_encode_bytes_field(17, patched_meta))
-        return bytes(out)
-
-    @classmethod
-    def _sync_agyhub_summaries_proto(
-        cls,
-        proto_path: Path,
-        conv_id: str,
-        raw_summary: bytes,
-        strip_cli_marker: bool = True,
-    ) -> bool:
-        """Atomically upsert `(conv_id, raw_summary)` into `~/.gemini/antigravity/agyhub_summaries_proto.pb`
-        (protobuf map `f1: { f1: conv_id, f2: raw_summary }`), optionally removing any CLI-source
-        marker entry for `conv_id` in `f2` so Antigravity Desktop App's persisted Hub cache matches
-        the standalone conversation immediately on reload/startup."""
-        if not proto_path.exists():
-            return False
-        try:
-            existing = proto_path.read_bytes()
-            fields = cls._pb_iter_fields(existing)
-        except (OSError, ValueError):
-            return False
-
-        cid_bytes = conv_id.encode("utf-8")
-        new_entry_payload = cls._pb_encode_bytes_field(1, cid_bytes) + cls._pb_encode_bytes_field(2, raw_summary)
-        new_entry = cls._pb_encode_bytes_field(1, new_entry_payload)
-
-        out = bytearray()
-        replaced = False
-        for field_num, wire_type, raw, payload in fields:
-            if wire_type == 2 and field_num in (1, 2):
-                try:
-                    sub = cls._pb_iter_fields(payload)
-                except ValueError:
-                    out.extend(raw)
-                    continue
-                entry_cid = next((sp for sfn, swt, _, sp in sub if sfn == 1 and swt == 2), None)
-                if field_num == 1 and entry_cid == cid_bytes:
-                    out.extend(new_entry)
-                    replaced = True
-                    continue
-                if field_num == 2 and strip_cli_marker and entry_cid == cid_bytes:
-                    continue
-            out.extend(raw)
-
-        if not replaced:
-            out.extend(new_entry)
-
-        tmp_path = proto_path.with_suffix(".pb.tmp")
-        try:
-            tmp_path.write_bytes(bytes(out))
-            tmp_path.replace(proto_path)
-            return True
-        except OSError:
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-            return False
-
-    @classmethod
-    def _patch_trajectory_db_standalone(
-        cls,
-        db_path: Path,
-        conv_id: Optional[str] = None,
-        set_app_source: bool = False,
-    ) -> None:
-        """Patch a copied/CLI trajectory SQLite DB's `trajectory_metadata_blob` (and optionally
-        `trajectory_meta.source`) so Antigravity Desktop App never re-classifies the standalone
-        conversation back into `default-cli-project` ("CLI Project")."""
-        if not db_path.exists():
-            return
-        try:
-            conn = sqlite3.connect(str(db_path), timeout=5.0)
-            try:
-                has_blob = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='trajectory_metadata_blob'"
-                ).fetchone()
-                if has_blob:
-                    rows = conn.execute("SELECT id, data FROM trajectory_metadata_blob").fetchall()
-                    if rows:
-                        for row_id, blob in rows:
-                            blob_bytes = bytes(blob) if isinstance(blob, (bytes, bytearray)) else b""
-                            patched = cls._pb_patch_trajectory_metadata_standalone(blob_bytes, conv_id=conv_id)
-                            if patched != blob_bytes:
-                                conn.execute(
-                                    "UPDATE trajectory_metadata_blob SET data = ? WHERE id = ?",
-                                    (patched, row_id),
-                                )
-                    else:
-                        patched = cls._pb_patch_trajectory_metadata_standalone(b"", conv_id=conv_id)
-                        conn.execute(
-                            "INSERT OR REPLACE INTO trajectory_metadata_blob (id, data) VALUES ('main', ?)",
-                            (patched,),
-                        )
-                if set_app_source:
-                    has_meta = conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='trajectory_meta'"
-                    ).fetchone()
-                    if has_meta:
-                        conn.execute(
-                            "UPDATE trajectory_meta SET source = 21 WHERE trajectory_type = 4 AND source = 17"
-                        )
-                conn.commit()
-            finally:
-                conn.close()
-        except sqlite3.Error:
-            pass
+    # Thin backwards-compatible delegators to modular `memgit.sync` helpers
+    _backup_sqlite_if_nonempty = staticmethod(backup_sqlite_if_nonempty)
+    _pb_encode_varint = staticmethod(pb_encode_varint)
+    _pb_read_varint = staticmethod(pb_read_varint)
+    _pb_iter_fields = staticmethod(pb_iter_fields)
+    _pb_encode_bytes_field = staticmethod(pb_encode_bytes_field)
+    _pb_encode_varint_field = staticmethod(pb_encode_varint_field)
+    _pb_patch_trajectory_metadata_standalone = staticmethod(pb_patch_trajectory_metadata_standalone)
+    _pb_patch_raw_summary_standalone = staticmethod(pb_patch_raw_summary_standalone)
+    _sync_agyhub_summaries_proto = staticmethod(sync_agyhub_summaries_proto)
+    _patch_trajectory_db_standalone = staticmethod(patch_trajectory_db_standalone)
 
     def _sync_antigravity_cli_session_to_app(
         self,
@@ -1208,234 +942,19 @@ class CheckpointConverter:
         ws_resolved: Optional[Path] = None,
         create_project: bool = False,
         default_cli_proj_existed_before: bool = True,
+        backup_tx: Optional[BackupTransaction] = None,
+        warnings_out: Optional[List[str]] = None,
     ) -> Tuple[Optional[str], List[str], int, Optional[str]]:
-        """Copy the newly created `agy` CLI conversation trajectory (`.db` merged cleanly from WAL,
-        or `.pb` fallback if SQLite store init hit a lock and left 0 steps), `brain/<cid>`,
-        `annotations/<cid>.pbtxt`, and summary metadata from `~/.gemini/antigravity-cli/`
-        into `~/.gemini/antigravity/` so the Antigravity Desktop App displays and opens the
-        conversation directly from its Conversations sidebar.
-
-        When `create_project=False` (default), assigns `project_id = "outside-of-project"` (and
-        rewrites protobuf metadata cleanly) so the resumed chat appears directly in the top-level
-        Conversations sidebar without creating a new Project or "CLI Project".
-        """
-        cli_conv_dir = home_resolved / ".gemini" / "antigravity-cli" / "conversations"
-        app_conv_dir = home_resolved / ".gemini" / "antigravity" / "conversations"
-        cli_brain_dir = home_resolved / ".gemini" / "antigravity-cli" / "brain"
-        app_brain_dir = home_resolved / ".gemini" / "antigravity" / "brain"
-        app_ann_dir = home_resolved / ".gemini" / "antigravity" / "annotations"
-        if not cli_conv_dir.exists():
-            return None, [], 0, None
-
-        # Track newest conversation ID across both .db and .pb files created/updated during this run
-        candidates: Dict[str, float] = {}
-        for pattern in ("*.db", "*.pb"):
-            for fpath in cli_conv_dir.glob(pattern):
-                mtime = fpath.stat().st_mtime
-                prev = before_convs.get(fpath.name)
-                if prev is None or mtime > prev:
-                    cid = fpath.stem
-                    if cid not in candidates or mtime > candidates[cid]:
-                        candidates[cid] = mtime
-        if not candidates:
-            return None, [], 0, None
-
-        conv_id = max(candidates.items(), key=lambda item: item[1])[0]
-        synced: List[str] = []
-        app_conv_dir.mkdir(parents=True, exist_ok=True)
-
-        src_db = cli_conv_dir / f"{conv_id}.db"
-        src_pb = cli_conv_dir / f"{conv_id}.pb"
-        dest_db = app_conv_dir / f"{conv_id}.db"
-        dest_pb = app_conv_dir / f"{conv_id}.pb"
-
-        synced_steps = self._backup_sqlite_if_nonempty(src_db, dest_db)
-        if synced_steps > 0:
-            if not create_project:
-                # Patch trajectory_metadata_blob in both App DB and CLI DB so Antigravity's
-                # Hub never re-derives `default-cli-project` ("CLI Project") from the .db file.
-                self._patch_trajectory_db_standalone(dest_db, conv_id=conv_id, set_app_source=True)
-                self._patch_trajectory_db_standalone(src_db, conv_id=conv_id, set_app_source=False)
-            synced.append(str(dest_db))
-        elif src_pb.exists() and src_pb.stat().st_size > 0:
-            # Never leave an empty 0-step .db shadowing the real .pb trajectory
-            if dest_db.exists():
-                dest_db.unlink()
-            shutil.copy2(src_pb, dest_pb)
-            synced.append(str(dest_pb))
-
-        src_brain = cli_brain_dir / conv_id
-        dest_brain = app_brain_dir / conv_id
-        if src_brain.exists() and src_brain.is_dir():
-            shutil.copytree(src_brain, dest_brain, dirs_exist_ok=True)
-            synced.append(str(dest_brain))
-
-        # Write ~/.gemini/antigravity/annotations/<conv_id>.pbtxt with the original title
-        if conversation_title:
-            app_ann_dir.mkdir(parents=True, exist_ok=True)
-            escaped_title = conversation_title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
-            now_sec = int(time.time())
-            ann_path = app_ann_dir / f"{conv_id}.pbtxt"
-            ann_path.write_text(
-                f'title:"{escaped_title}"  last_user_view_time:{{seconds:{now_sec}  nanos:0}}',
-                encoding="utf-8",
-            )
-            synced.append(str(ann_path))
-
-        project_id: Optional[str] = None
-        workspace_uris: Optional[str] = None
-        cli_summary_db = home_resolved / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
-        if create_project:
-            if cli_summary_db.exists():
-                try:
-                    cconn = sqlite3.connect(str(cli_summary_db), timeout=5.0)
-                    try:
-                        crow = cconn.execute(
-                            "SELECT project_id, workspace_uris FROM conversation_summaries WHERE conversation_id = ?",
-                            (conv_id,),
-                        ).fetchone()
-                        if crow:
-                            project_id = crow[0] or None
-                            workspace_uris = crow[1] or None
-                    finally:
-                        cconn.close()
-                except sqlite3.Error:
-                    pass
-            if not workspace_uris and ws_resolved is not None:
-                workspace_uris = json.dumps([f"file://{ws_resolved}"])
-        else:
-            # Standalone conversation (no sidebar Project created) — matches Antigravity's native
-            # top-level conversation bucket (`project_id = "outside-of-project"`, `workspace_uris = ""`).
-            project_id = "outside-of-project"
-            workspace_uris = ""
-
-        # Sync title, project_id, workspace_uris, source='', and properly re-encoded raw_summary
-        # into Antigravity App's (and CLI's) conversation_summaries.db and agyhub_summaries_proto.pb.
-        app_summary_db = home_resolved / ".gemini" / "antigravity" / "conversation_summaries.db"
-        agyhub_proto = home_resolved / ".gemini" / "antigravity" / "agyhub_summaries_proto.pb"
-        summary_targets = [
-            (app_summary_db, "antigravity", True),
-        ]
-        if not create_project:
-            summary_targets.append((cli_summary_db, "antigravity-cli", False))
-
-        def _apply_summary_sync() -> Optional[bytes]:
-            latest_patched_raw: Optional[bytes] = None
-            for summary_db, data_dir_name, allow_insert in summary_targets:
-                if not summary_db.exists():
-                    continue
-                try:
-                    sconn = sqlite3.connect(str(summary_db), timeout=5.0)
-                    try:
-                        existing = sconn.execute(
-                            "SELECT title, project_id, workspace_uris, raw_summary "
-                            "FROM conversation_summaries WHERE conversation_id = ?",
-                            (conv_id,),
-                        ).fetchone()
-                        if existing is not None:
-                            new_title = conversation_title or existing[0] or ""
-                            new_proj = project_id if project_id is not None else (existing[1] or "outside-of-project")
-                            new_ws = workspace_uris if workspace_uris is not None else (existing[2] or "")
-                            raw_blob = existing[3]
-                            if isinstance(raw_blob, (bytes, bytearray)) and not create_project:
-                                patched = self._pb_patch_raw_summary_standalone(
-                                    bytes(raw_blob), title=new_title, conv_id=conv_id
-                                )
-                                if data_dir_name == "antigravity":
-                                    latest_patched_raw = patched
-                                elif latest_patched_raw is None:
-                                    latest_patched_raw = patched
-                                sconn.execute(
-                                    "UPDATE conversation_summaries "
-                                    "SET title = ?, project_id = ?, workspace_uris = ?, source = '', "
-                                    "app_data_dir = ?, raw_summary = ? "
-                                    "WHERE conversation_id = ?",
-                                    (new_title, new_proj, new_ws, data_dir_name, patched, conv_id),
-                                )
-                            else:
-                                sconn.execute(
-                                    "UPDATE conversation_summaries "
-                                    "SET title = ?, project_id = ?, workspace_uris = ?, source = '', app_data_dir = ? "
-                                    "WHERE conversation_id = ?",
-                                    (new_title, new_proj, new_ws, data_dir_name, conv_id),
-                                )
-                        elif allow_insert:
-                            now_sql = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
-                            sconn.execute(
-                                "INSERT OR REPLACE INTO conversation_summaries "
-                                "(conversation_id, title, step_count, last_modified_time, workspace_uris, "
-                                "status, source, project_id, last_user_input_time, last_user_input_step_index, app_data_dir) "
-                                "VALUES (?, ?, ?, ?, ?, 'CASCADE_RUN_STATUS_IDLE', '', ?, ?, 0, 'antigravity')",
-                                (
-                                    conv_id,
-                                    conversation_title or "",
-                                    synced_steps,
-                                    now_sql,
-                                    workspace_uris or "",
-                                    project_id or "outside-of-project",
-                                    now_sql,
-                                ),
-                            )
-                        sconn.commit()
-                    finally:
-                        sconn.close()
-                except sqlite3.Error:
-                    pass
-            return latest_patched_raw
-
-        patched_raw = _apply_summary_sync()
-        if app_summary_db.exists():
-            # Allow any trailing post-exit Hub flush from `agy` (~1–3s debounce) to settle,
-            # then re-verify so Antigravity Desktop App's summary DB + agyhub_summaries_proto.pb
-            # remain cleanly patched as a standalone conversation.
-            for wait_s in (1.0, 2.0):
-                time.sleep(wait_s)
-                patched_raw_next = _apply_summary_sync()
-                if patched_raw_next is not None:
-                    patched_raw = patched_raw_next
-
-        if patched_raw is not None and agyhub_proto.exists():
-            if self._sync_agyhub_summaries_proto(
-                agyhub_proto,
-                conv_id=conv_id,
-                raw_summary=patched_raw,
-                strip_cli_marker=not create_project,
-            ):
-                synced.append(str(agyhub_proto))
-
-        # Clean up unused "CLI Project" (default-cli-project.json) when running standalone
-        if not create_project:
-            default_cli_proj = home_resolved / ".gemini" / "config" / "projects" / "default-cli-project.json"
-            if default_cli_proj.exists():
-                in_use = False
-                if app_summary_db.exists():
-                    try:
-                        cconn = sqlite3.connect(str(app_summary_db), timeout=5.0)
-                        try:
-                            cnt = cconn.execute(
-                                "SELECT COUNT(*) FROM conversation_summaries WHERE project_id = 'default-cli-project'"
-                            ).fetchone()[0]
-                            in_use = int(cnt) > 0
-                        finally:
-                            cconn.close()
-                    except sqlite3.Error:
-                        in_use = default_cli_proj_existed_before
-                if not in_use:
-                    try:
-                        default_cli_proj.unlink()
-                    except OSError:
-                        pass
-
-        # Touch the project JSON file only when a project was explicitly created
-        if create_project and project_id and project_id != "outside-of-project":
-            proj_json = home_resolved / ".gemini" / "config" / "projects" / f"{project_id}.json"
-            if proj_json.exists():
-                try:
-                    os.utime(proj_json, None)
-                except OSError:
-                    pass
-
-        return conv_id, synced, synced_steps, project_id
+        return sync_antigravity_cli_session_to_app(
+            home_resolved=home_resolved,
+            before_convs=before_convs,
+            conversation_title=conversation_title,
+            ws_resolved=ws_resolved,
+            create_project=create_project,
+            default_cli_proj_existed_before=default_cli_proj_existed_before,
+            backup_tx=backup_tx,
+            warnings_out=warnings_out,
+        )
 
     def _bootstrap_target_cli_session(
         self,
@@ -1446,6 +965,8 @@ class CheckpointConverter:
         bootstrap_bin: Optional[str] = None,
         timeout_s: int = 120,
         create_project: bool = False,
+        backup_tx: Optional[BackupTransaction] = None,
+        warnings_out: Optional[List[str]] = None,
     ) -> BootstrapSessionReport:
         """Automatically invoke the destination agent's official CLI to create a native
         resumable session so reopening/refreshing the app shows the resumed conversation:
@@ -1470,6 +991,10 @@ class CheckpointConverter:
 
         prompt = self._build_bootstrap_prompt(checkpoint, canonical_agent)
         resolved_bin = bootstrap_bin or shutil.which(cli_name)
+        if not resolved_bin:
+            local_cand = home_resolved / ".local" / "bin" / cli_name
+            if local_cand.exists() and os.access(local_cand, os.X_OK):
+                resolved_bin = str(local_cand)
         if not resolved_bin:
             return BootstrapSessionReport(
                 agent=canonical_agent,
@@ -1549,6 +1074,8 @@ class CheckpointConverter:
                     ws_resolved=ws_resolved,
                     create_project=create_project,
                     default_cli_proj_existed_before=default_cli_proj_existed_before,
+                    backup_tx=backup_tx,
+                    warnings_out=warnings_out,
                 )
             sync_note = (
                 f" Synced session {conv_id} ({synced_steps} SQLite steps, project={project_id or 'none'}) into ~/.gemini/antigravity/ for Desktop App sidebar."
@@ -1612,6 +1139,8 @@ class CheckpointConverter:
         bootstrap_bin: Optional[str] = None,
         bootstrap_timeout_s: int = 120,
         create_project: bool = False,
+        dry_run: bool = False,
+        enable_backup: bool = True,
     ) -> ConversionResult:
         """Convert a checkpoint, write it non-destructively to the target agent's folders,
         register the project & session so the app opens ready-to-use, and verify loading.
@@ -1638,12 +1167,64 @@ class CheckpointConverter:
             include_private=include_private,
         )
 
+        is_claude = target_agent.lower() in ("claude", AgentType.CLAUDE_CODE.value)
+        encoded_key = (
+            encode_claude_project_key(ws_resolved)
+            if is_claude
+            else checkpoint.repo_name
+        )
+
         written: List[str] = []
         ops = list(pkg.compilation_notes)
+        tier2_warnings: List[str] = []
+        tier2_status = "skipped"
 
-        # Write workspace files (non-destructive delimited upsert for CLAUDE.md / AGENTS.md / GEMINI.md)
+        if dry_run:
+            for rel_path in pkg.workspace_files:
+                written.append(str(ws_resolved / rel_path))
+            for rel_path in pkg.home_files:
+                written.append(str(home_resolved / rel_path))
+            ops.append(f"[DRY RUN] Would install {len(written)} Tier-1 file(s) for {target_agent} ({target_model}).")
+            if bootstrap_session:
+                ops.append(f"[DRY RUN] Would bootstrap native {target_agent} CLI session (create_project={create_project}).")
+            return ConversionResult(
+                checkpoint_id=checkpoint.checkpoint_id,
+                source_agent=checkpoint.source_agent,
+                source_model=checkpoint.source_model,
+                target_agent=target_agent,
+                target_model=target_model,
+                encoded_project_key=encoded_key,
+                session_id=None,
+                workspace_root=str(ws_resolved),
+                user_home=str(home_resolved),
+                written_files=written,
+                operations_performed=ops,
+                boot_verification=None,
+                bootstrap_session=None,
+                tier1_succeeded=True,
+                tier2_status="skipped",
+                tier2_warnings=[],
+                backup_id=None,
+                dry_run=True,
+            )
+
+        backup_tx: Optional[BackupTransaction] = None
+        if enable_backup:
+            backup_tx = BackupManager(home_resolved).begin(
+                operation="convert_and_install",
+                metadata={
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "target_agent": target_agent,
+                    "target_model": target_model,
+                    "workspace_root": str(ws_resolved),
+                },
+            )
+
+        # Tier-1: Write workspace files (non-destructive delimited upsert for CLAUDE.md / AGENTS.md / GEMINI.md)
         for rel_path, content in pkg.workspace_files.items():
             dest = ws_resolved / rel_path
+            if backup_tx is not None:
+                backup_tx.snapshot(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
             if rel_path in ("CLAUDE.md", "AGENTS.md", "GEMINI.md") and dest.exists():
                 existing = dest.read_text(encoding="utf-8")
@@ -1656,32 +1237,35 @@ class CheckpointConverter:
                 dest.write_text(content, encoding="utf-8")
             written.append(str(dest))
 
-        # Write user home files (e.g. ~/.claude/projects/<encoded-key>/memory/* or ~/.codex/*)
+        # Tier-1: Write user home files (e.g. ~/.claude/projects/<encoded-key>/memory/* or ~/.codex/*)
         for rel_path, content in pkg.home_files.items():
             dest = home_resolved / rel_path
+            if backup_tx is not None:
+                backup_tx.snapshot(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written.append(str(dest))
 
-        is_claude = target_agent.lower() in ("claude", AgentType.CLAUDE_CODE.value)
-        encoded_key = (
-            encode_claude_project_key(ws_resolved)
-            if is_claude
-            else checkpoint.repo_name
-        )
-
         session_id: Optional[str] = None
         if is_claude:
-            session_id, reg_written, reg_ops = self._register_claude_project_and_session(
-                checkpoint=checkpoint,
-                pkg=pkg,
-                ws_resolved=ws_resolved,
-                home_resolved=home_resolved,
-                encoded_key=encoded_key,
-                target_model=target_model,
-            )
-            written.extend(reg_written)
-            ops.extend(reg_ops)
+            if backup_tx is not None:
+                backup_tx.snapshot(home_resolved / ".claude.json")
+                backup_tx.snapshot(home_resolved / ".claude" / "history.jsonl")
+            try:
+                session_id, reg_written, reg_ops = self._register_claude_project_and_session(
+                    checkpoint=checkpoint,
+                    pkg=pkg,
+                    ws_resolved=ws_resolved,
+                    home_resolved=home_resolved,
+                    encoded_key=encoded_key,
+                    target_model=target_model,
+                )
+                written.extend(reg_written)
+                ops.extend(reg_ops)
+                tier2_status = "applied"
+            except Exception as exc:
+                tier2_status = "fallback"
+                tier2_warnings.append(f"Claude Tier-2 session registration fell back to Tier-1 files: {exc}")
 
         bootstrap_report: Optional[BootstrapSessionReport] = None
         if bootstrap_session:
@@ -1693,12 +1277,22 @@ class CheckpointConverter:
                 bootstrap_bin=bootstrap_bin,
                 timeout_s=bootstrap_timeout_s,
                 create_project=create_project,
+                backup_tx=backup_tx,
+                warnings_out=tier2_warnings,
             )
             ops.append(bootstrap_report.note)
             if bootstrap_report.synced_files:
                 written.extend(bootstrap_report.synced_files)
+                tier2_status = "fallback" if tier2_warnings else "applied"
+            elif not bootstrap_report.succeeded:
+                tier2_status = "fallback"
             if session_id is None and bootstrap_report.conversation_id:
                 session_id = bootstrap_report.conversation_id
+
+        backup_id: Optional[str] = None
+        if backup_tx is not None:
+            backup_tx.commit()
+            backup_id = backup_tx.op_id
 
         boot_report: Optional[AgentBootSimulationReport] = None
         if verify:
@@ -1729,4 +1323,9 @@ class CheckpointConverter:
             operations_performed=ops,
             boot_verification=boot_report,
             bootstrap_session=bootstrap_report,
+            tier1_succeeded=True,
+            tier2_status=tier2_status,
+            tier2_warnings=tier2_warnings,
+            backup_id=backup_id,
+            dry_run=False,
         )

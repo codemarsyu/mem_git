@@ -8,12 +8,13 @@ Models OpenAI Codex CLI's Three-Tier Architecture:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 from typing import List, Optional
 
-from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
+from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport, AgentSessionSummary
 from memgit.git_wip import capture_git_wip_bundle
 from memgit.models import (
     AgentType,
@@ -42,6 +43,45 @@ CODEX_MAX_AGENTS_BYTES = 32 * 1024  # 32 KiB cascading limit
 
 class CodexCLIAdapter(AgentAdapter):
     agent_type = AgentType.CODEX_CLI.value
+
+    def list_sessions(
+        self,
+        user_home: Path,
+        workspace_root: Optional[Path] = None,
+    ) -> List[AgentSessionSummary]:
+        sess_root = user_home.resolve() / ".codex" / "sessions"
+        if not sess_root.exists():
+            return []
+        summaries: List[AgentSessionSummary] = []
+        for fpath in sorted(sess_root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+            turns = 0
+            title = fpath.parent.name if fpath.stem == "execution" else fpath.stem
+            try:
+                for line in fpath.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if not line.strip():
+                        continue
+                    turns += 1
+                    obj = json.loads(line)
+                    if title in (fpath.stem, fpath.parent.name):
+                        cand = obj.get("summary") or obj.get("content") or obj.get("text")
+                        if isinstance(cand, str) and cand.strip():
+                            first_line = cand.strip().splitlines()[0]
+                            title = (first_line[:77] + "...") if len(first_line) > 80 else first_line
+            except (OSError, json.JSONDecodeError):
+                pass
+            ts = datetime.fromtimestamp(fpath.stat().st_mtime, tz=timezone.utc).isoformat()
+            summaries.append(
+                AgentSessionSummary(
+                    session_id=fpath.parent.name if fpath.stem == "execution" else fpath.stem,
+                    agent_type=self.agent_type,
+                    title=title,
+                    updated_at=ts,
+                    turn_count=turns,
+                    workspace_path="",
+                    source_path=str(fpath),
+                )
+            )
+        return summaries
 
     @staticmethod
     def seed_mock_codex_update(

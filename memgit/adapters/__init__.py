@@ -9,6 +9,7 @@ from memgit.adapters.base import AgentAdapter, AgentBootSimulationReport
 from memgit.adapters.claude_code import ClaudeCodeAdapter
 from memgit.adapters.codex_cli import CodexCLIAdapter
 from memgit.adapters.cursor import CursorAdapter
+from memgit.adapters.gemini_cli import GeminiCLIAdapter
 from memgit.models import AgentType
 
 _ADAPTERS: Dict[str, AgentAdapter] = {
@@ -17,7 +18,10 @@ _ADAPTERS: Dict[str, AgentAdapter] = {
     AgentType.CODEX_CLI.value: CodexCLIAdapter(),
     "codex-cli": CodexCLIAdapter(),
     AgentType.ANTIGRAVITY.value: AntigravityAdapter(),
-    "gemini": AntigravityAdapter(),
+    "agy": AntigravityAdapter(),
+    AgentType.GEMINI_CLI.value: GeminiCLIAdapter(),
+    "gemini": GeminiCLIAdapter(),
+    "gemini-app": GeminiCLIAdapter(),
     AgentType.CURSOR.value: CursorAdapter(),
 }
 
@@ -37,6 +41,7 @@ __all__ = [
     "ClaudeCodeAdapter",
     "CodexCLIAdapter",
     "AntigravityAdapter",
+    "GeminiCLIAdapter",
     "CursorAdapter",
     "get_adapter",
 ]

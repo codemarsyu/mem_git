@@ -98,6 +98,21 @@ def cmd_pull(args: argparse.Namespace) -> int:
         include_private=not args.strip_private,
         restore_code_wip=not args.no_code_wip,
     )
+    if args.bootstrap:
+        from memgit.converter import CheckpointConverter
+        from memgit.models import MemoryCheckpointIR
+
+        raw_chk = client.fetch_checkpoint(args.repo, res["checkpoint_id"])
+        chk = MemoryCheckpointIR.from_dict(raw_chk)
+        boot = CheckpointConverter()._bootstrap_target_cli_session(
+            checkpoint=chk,
+            target_agent=args.target_agent,
+            ws_resolved=ws,
+            home_resolved=home,
+            bootstrap_bin=args.bootstrap_bin,
+            timeout_s=args.bootstrap_timeout,
+        )
+        res["bootstrap_session"] = boot.to_dict()
     print(json.dumps(res, indent=2))
     return 0
 
@@ -149,6 +164,10 @@ def cmd_convert(args: argparse.Namespace) -> int:
         target_host=fp,
         include_private=not args.strip_private,
         verify=not args.no_verify,
+        bootstrap_session=bool(args.bootstrap),
+        bootstrap_bin=args.bootstrap_bin,
+        bootstrap_timeout_s=args.bootstrap_timeout,
+        create_project=bool(args.create_project),
     )
     print(json.dumps(res.to_dict(), indent=2))
     return 0
@@ -179,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_chk.add_argument("--workspace", default=".", help="Workspace root path")
     p_chk.add_argument("--home", default=str(Path.home()), help="User home path")
     p_chk.add_argument("--repo", required=True, help="Repository identifier")
-    p_chk.add_argument("--agent", required=True, choices=["claude-code", "codex", "antigravity", "cursor"])
+    p_chk.add_argument("--agent", required=True, choices=["claude-code", "codex", "antigravity", "gemini-cli", "cursor"])
     p_chk.add_argument("--model", required=True, help="Source LLM model name")
     p_chk.add_argument("--author", default="developer", help="Checkpoint author")
     p_chk.add_argument("--branch", default="main", help="Branch name")
@@ -191,10 +210,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_chk.set_defaults(func=cmd_checkpoint)
 
     # convert
-    p_conv = sub.add_parser("convert", help="Convert a checkpoint JSON into target agent format (Claude/Codex/Antigravity) and install")
+    p_conv = sub.add_parser("convert", help="Convert a checkpoint JSON into target agent format (Claude/Codex/Antigravity/Gemini CLI) and install")
     p_conv.add_argument("--checkpoint", required=True, help="Path to MemoryCheckpointIR JSON file")
-    p_conv.add_argument("--target-agent", required=True, choices=["claude-code", "codex", "antigravity", "cursor"])
-    p_conv.add_argument("--target-model", required=True, help="Target LLM model name (e.g., claude-4-opus, gpt-5-codex)")
+    p_conv.add_argument("--target-agent", required=True, choices=["claude-code", "codex", "antigravity", "gemini-cli", "cursor"])
+    p_conv.add_argument("--target-model", required=True, help="Target LLM model name (e.g., claude-4-opus, gpt-5-codex, gemini-3-pro)")
     p_conv.add_argument("--workspace", required=True, help="Target workspace root directory")
     p_conv.add_argument("--home", default=str(Path.home()), help="Target user home directory")
     p_conv.add_argument("--target-os", default=None, help="Override target OS fingerprint")
@@ -202,6 +221,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_conv.add_argument("--cuda", action="store_true", help="Indicate target machine has CUDA GPU")
     p_conv.add_argument("--strip-private", action="store_true", help="Strip M_private personal directives")
     p_conv.add_argument("--no-verify", action="store_true", help="Skip post-write target agent boot simulation")
+    p_conv.add_argument("--bootstrap", action="store_true", help="Auto-run destination CLI (`agy` for antigravity, `gemini` for gemini-cli) to seed a native resumable session")
+    p_conv.add_argument("--bootstrap-bin", default=None, help="Optional explicit path to the destination CLI binary")
+    p_conv.add_argument("--bootstrap-timeout", type=int, default=120, help="Timeout in seconds for CLI session bootstrap")
+    p_conv.add_argument("--create-project", action="store_true", help="Create a new Antigravity sidebar Project (default: resume as standalone conversation outside-of-project)")
     p_conv.set_defaults(func=cmd_convert)
 
     # pull
@@ -210,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull.add_argument("--home", required=True, help="Target user home path")
     p_pull.add_argument("--repo", required=True, help="Repository identifier")
     p_pull.add_argument("--ref", default="main", help="Branch name or checkpoint ID")
-    p_pull.add_argument("--target-agent", required=True, choices=["claude-code", "codex", "antigravity", "cursor"])
+    p_pull.add_argument("--target-agent", required=True, choices=["claude-code", "codex", "antigravity", "gemini-cli", "cursor"])
     p_pull.add_argument("--target-model", required=True, help="Destination LLM model name")
     p_pull.add_argument("--server-url", required=True, help="Remote MemGit Server URL")
     p_pull.add_argument("--target-os", default=None, help="Override target OS fingerprint")
@@ -219,6 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull.add_argument("--hostname", default=None, help="Target hostname")
     p_pull.add_argument("--strip-private", action="store_true", help="Strip M_private personal directives")
     p_pull.add_argument("--no-code-wip", action="store_true", help="Skip Git WIP patch restoration")
+    p_pull.add_argument("--bootstrap", action="store_true", help="Auto-run destination CLI (`agy` for antigravity, `gemini` for gemini-cli) to seed a native resumable session")
+    p_pull.add_argument("--bootstrap-bin", default=None, help="Optional explicit path to the destination CLI binary")
+    p_pull.add_argument("--bootstrap-timeout", type=int, default=120, help="Timeout in seconds for CLI session bootstrap")
     p_pull.set_defaults(func=cmd_pull)
 
     # merge

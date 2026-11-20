@@ -17,6 +17,7 @@ class AgentType(str, Enum):
     CLAUDE_CODE = "claude-code"
     CODEX_CLI = "codex"
     ANTIGRAVITY = "antigravity"
+    GEMINI_CLI = "gemini-cli"
     CURSOR = "cursor"
 
 

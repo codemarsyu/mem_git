@@ -449,6 +449,7 @@ class AntigravityAdapter(AgentAdapter):
             workspace_root / "GEMINI.md",
             workspace_root / "AGENTS.md",
             workspace_root / ".agent-context" / "HANDOFF.md",
+            workspace_root / ".agent-context" / "CHAT_HISTORY.md",
         ):
             if p.exists():
                 report.loaded_files.append(str(p))
@@ -474,12 +475,16 @@ class AntigravityAdapter(AgentAdapter):
                             report.loaded_files.append(str(p))
                             chunks.append(p.read_text(encoding="utf-8"))
 
-        # Load Brain Artifacts (task.md, implementation_plan.md)
+        # Load Brain Artifacts (task.md, implementation_plan.md, chat_history.md)
         brain_root = user_home / ".gemini" / "antigravity" / "brain"
         if brain_root.exists():
             for conv_dir in sorted(brain_root.iterdir()):
                 if conv_dir.is_dir():
-                    for p in (conv_dir / "task.md", conv_dir / "implementation_plan.md"):
+                    for p in (
+                        conv_dir / "task.md",
+                        conv_dir / "implementation_plan.md",
+                        conv_dir / "chat_history.md",
+                    ):
                         if p.exists():
                             report.loaded_files.append(str(p))
                             chunks.append(p.read_text(encoding="utf-8"))

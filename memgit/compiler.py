@@ -233,7 +233,7 @@ def _render_chat_history_markdown(chk: MemoryCheckpointIR) -> str:
         f"# Portable Conversation History — `{chk.repo_name}` (`{chk.checkpoint_id}`)",
         "",
         f"- **Source Agent / Model**: `{chk.source_agent}` (`{chk.source_model}`)",
-        f"- **Captured Turns**: `{len(chk.conversation_history)}` (all `<thinking>` blocks & provider signatures stripped)",
+        f"- **Captured Turns**: `{len(chk.conversation_history)}` (all model reasoning blocks & provider signatures stripped)",
         "",
     ]
     if not chk.conversation_history:
@@ -273,6 +273,7 @@ def _render_concise_agents_md(
         "",
         "## Continuity Routing Pointers",
         "- **Full Handoff & Execution State**: `.agent-context/HANDOFF.md`",
+        "- **Conversation History**: `.agent-context/CHAT_HISTORY.md`",
         "- **Topic Knowledge Base**: `.agent-context/memory/`",
         "",
         "## Core Architectural Constraints",
@@ -459,8 +460,32 @@ def compile_checkpoint(
 
         pkg.home_files[f"{brain_base}/task.md"] = "\n".join(task_lines) + "\n"
         pkg.home_files[f"{brain_base}/implementation_plan.md"] = handoff_md
+        pkg.home_files[f"{brain_base}/chat_history.md"] = chat_history_md
         pkg.compilation_notes.append(
-            f"Compiled for Google Antigravity ({target_model}): {len(chk.topic_memories)} Knowledge Items + structured Artifacts (task.md, implementation_plan.md)."
+            f"Compiled for Google Antigravity ({target_model}): {len(chk.topic_memories)} Knowledge Items + "
+            f"structured Artifacts (task.md, implementation_plan.md, chat_history.md with {len(chk.conversation_history)} turns)."
+        )
+
+    elif agent_norm in (AgentType.GEMINI_CLI.value, "gemini", "gemini-app"):
+        # Gemini CLI / Gemini App (distinct from Antigravity):
+        # 1. Workspace GEMINI.md with cognitive preamble + concise routing index
+        pkg.workspace_files["GEMINI.md"] = (
+            _model_cognitive_preamble(chk, target_model, target_host)
+            + "\n"
+            + agents_md
+        )
+        # 2. Global ~/.gemini/GEMINI.md + ~/.gemini/memories/{memory_summary.md, chat_history.md}
+        pkg.home_files[".gemini/GEMINI.md"] = (
+            f"# Global Gemini Instructions (Synced via MemGit `{chk.checkpoint_id}`)\n"
+            f"- Active Project: `{chk.repo_name}` (`{target_host.workspace_root}`)\n"
+            f"- Default Host: `{target_host.os_name}/{target_host.arch}`\n"
+            f"- Inspect workspace `GEMINI.md`, `.agent-context/HANDOFF.md`, and `.agent-context/CHAT_HISTORY.md` on startup.\n"
+        )
+        pkg.home_files[".gemini/memories/memory_summary.md"] = handoff_md
+        pkg.home_files[".gemini/memories/chat_history.md"] = chat_history_md
+        pkg.compilation_notes.append(
+            f"Compiled for Gemini CLI / Gemini App ({target_model}): GEMINI.md + ~/.gemini/GEMINI.md + "
+            f"~/.gemini/memories/chat_history.md ({len(chk.conversation_history)} turns)."
         )
 
     elif agent_norm == AgentType.CURSOR.value:
